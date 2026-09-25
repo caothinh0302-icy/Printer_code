@@ -4085,3 +4085,583 @@ try: _apply_pneumatic()            # pneumatic on by default -> grey out stepper
 except Exception: pass
 root.after(1500, query_position)   # begin live position polling
 root.mainloop()
+
+# voron control tab (start of ricky voron commit)
+
+# ==========================================
+# --- VORON / SLA CONTROL TAB ---
+# ==========================================
+
+# ----- variables -----
+
+voron_host_var = tk.StringVar(value="voron.local")
+voron_connection_var = tk.StringVar(
+    value="Moonraker: Not connected"
+)
+voron_state_var = tk.StringVar(
+    value="State: unknown"
+)
+
+voron_z_var = tk.StringVar(value="—")
+voron_homed_var = tk.StringVar(value="Not homed")
+voron_job_var = tk.StringVar(value="—")
+
+voron_progress_var = tk.DoubleVar(value=0.0)
+voron_step_var = tk.DoubleVar(value=1.0)
+voron_file_var = tk.StringVar(value="")
+
+
+# ----- main wrapper -----
+
+voron_wrapper = ttk.Frame(tab_voron)
+voron_wrapper.pack(
+    fill="both",
+    expand=True,
+    padx=20,
+    pady=15
+)
+
+
+# =========================================================
+# CONNECTION
+# =========================================================
+
+voron_conn = ttk.LabelFrame(
+    voron_wrapper,
+    text="1. Voron / SLA Connection",
+    padding=15
+)
+
+voron_conn.pack(fill="x", pady=(0, 10))
+
+ttk.Label(
+    voron_conn,
+    text="Host / IP:"
+).grid(
+    row=0,
+    column=0,
+    padx=5,
+    pady=5,
+    sticky="e"
+)
+
+voron_host_entry = ttk.Entry(
+    voron_conn,
+    textvariable=voron_host_var,
+    width=32
+)
+
+voron_host_entry.grid(
+    row=0,
+    column=1,
+    padx=5,
+    pady=5,
+    sticky="we"
+)
+
+voron_connect_btn = ttk.Button(
+    voron_conn,
+    text="CONNECT",
+    style="Accent.TButton",
+    command=voron_connect
+)
+
+voron_connect_btn.grid(
+    row=0,
+    column=2,
+    padx=10,
+    pady=5
+)
+
+ttk.Label(
+    voron_conn,
+    textvariable=voron_connection_var,
+    font=("Segoe UI", 10, "bold"),
+    foreground="#A8E6CF"
+).grid(
+    row=0,
+    column=3,
+    padx=15,
+    pady=5
+)
+
+ttk.Label(
+    voron_conn,
+    textvariable=voron_state_var,
+    font=("Segoe UI", 10, "bold")
+).grid(
+    row=1,
+    column=1,
+    padx=5,
+    sticky="w"
+)
+
+ttk.Label(
+    voron_conn,
+    text=(
+        "Active target: Z-axis SLA build-plate motion. "
+        "Vat rotation is manual."
+    ),
+    foreground="#8FA5B8",
+    font=("Segoe UI", 8)
+).grid(
+    row=1,
+    column=2,
+    columnspan=2,
+    padx=10,
+    sticky="w"
+)
+
+voron_conn.columnconfigure(1, weight=1)
+
+
+# =========================================================
+# LOWER TWO-COLUMN AREA
+# =========================================================
+
+voron_body = ttk.Frame(voron_wrapper)
+voron_body.pack(fill="both", expand=True)
+
+voron_left = ttk.Frame(voron_body)
+voron_left.pack(
+    side=tk.LEFT,
+    fill="both",
+    expand=True,
+    padx=(0, 8)
+)
+
+voron_right = ttk.Frame(voron_body)
+voron_right.pack(
+    side=tk.RIGHT,
+    fill="both",
+    expand=True,
+    padx=(8, 0)
+)
+
+
+# =========================================================
+# LEFT — BUILD PLATE / Z CONTROL
+# =========================================================
+
+voron_motion = ttk.LabelFrame(
+    voron_left,
+    text="2. Build Plate / Z Control",
+    padding=15
+)
+
+voron_motion.pack(fill="x", pady=(0, 10))
+
+
+# position
+
+zpos = ttk.Frame(voron_motion)
+zpos.pack(fill="x", pady=(0, 8))
+
+ttk.Label(
+    zpos,
+    text="Current Z:",
+    font=("Segoe UI", 10, "bold")
+).pack(side=tk.LEFT)
+
+ttk.Label(
+    zpos,
+    textvariable=voron_z_var,
+    font=("Consolas", 12, "bold"),
+    foreground="#A8E6CF"
+).pack(side=tk.LEFT, padx=(8, 20))
+
+ttk.Label(
+    zpos,
+    text="Homed:"
+).pack(side=tk.LEFT)
+
+ttk.Label(
+    zpos,
+    textvariable=voron_homed_var,
+    font=("Segoe UI", 10, "bold")
+).pack(side=tk.LEFT, padx=6)
+
+
+# step size
+
+step_row = ttk.Frame(voron_motion)
+step_row.pack(fill="x", pady=8)
+
+ttk.Label(
+    step_row,
+    text="Step size:",
+    font=("Segoe UI", 10, "bold")
+).pack(side=tk.LEFT, padx=(0, 8))
+
+for value, label in (
+    (0.1, "0.1 mm"),
+    (1.0, "1 mm"),
+    (10.0, "10 mm"),
+):
+    ttk.Radiobutton(
+        step_row,
+        text=label,
+        variable=voron_step_var,
+        value=value
+    ).pack(side=tk.LEFT, padx=6)
+
+
+# Z movement
+
+z_btns = ttk.Frame(voron_motion)
+z_btns.pack(pady=12)
+
+ttk.Button(
+    z_btns,
+    text="▲  Z +",
+    width=16,
+    command=lambda: voron_jog_z(+1)
+).grid(
+    row=0,
+    column=0,
+    padx=5,
+    pady=4
+)
+
+ttk.Button(
+    z_btns,
+    text="▼  Z −",
+    width=16,
+    command=lambda: voron_jog_z(-1)
+).grid(
+    row=1,
+    column=0,
+    padx=5,
+    pady=4
+)
+
+ttk.Button(
+    z_btns,
+    text="HOME Z",
+    width=16,
+    style="Accent.TButton",
+    command=voron_home_z
+).grid(
+    row=2,
+    column=0,
+    padx=5,
+    pady=(10, 4)
+)
+
+ttk.Label(
+    voron_motion,
+    text=(
+        "Only the configured Z build-plate axis is exposed here. "
+        "No X/Y motion is assumed."
+    ),
+    foreground="#888",
+    font=("Segoe UI", 8),
+    wraplength=400,
+    justify="left"
+).pack(anchor="w", pady=(8, 0))
+
+
+# =========================================================
+# LEFT — G-CODE / JOB
+# =========================================================
+
+voron_job_frame = ttk.LabelFrame(
+    voron_left,
+    text="3. G-Code / Job",
+    padding=15
+)
+
+voron_job_frame.pack(fill="x", pady=(0, 10))
+
+ttk.Label(
+    voron_job_frame,
+    text="Selected / uploaded file:"
+).pack(anchor="w")
+
+voron_file_entry = ttk.Entry(
+    voron_job_frame,
+    textvariable=voron_file_var
+)
+
+voron_file_entry.pack(
+    fill="x",
+    pady=(4, 8)
+)
+
+job_buttons = ttk.Frame(voron_job_frame)
+job_buttons.pack(fill="x")
+
+ttk.Button(
+    job_buttons,
+    text="CHOOSE FILE",
+    command=voron_choose_gcode
+).pack(
+    side=tk.LEFT,
+    fill="x",
+    expand=True,
+    padx=(0, 4)
+)
+
+voron_upload_btn = ttk.Button(
+    job_buttons,
+    text="UPLOAD",
+    style="Accent.TButton",
+    command=voron_upload_gcode
+)
+
+voron_upload_btn.pack(
+    side=tk.LEFT,
+    fill="x",
+    expand=True,
+    padx=(4, 0)
+)
+
+ttk.Label(
+    voron_job_frame,
+    text=(
+        "Upload stages the file on the Voron. "
+        "Starting the print is a separate action."
+    ),
+    foreground="#888",
+    font=("Segoe UI", 8),
+    wraplength=400
+).pack(anchor="w", pady=(8, 0))
+
+
+# =========================================================
+# RIGHT — PRINTER STATUS
+# =========================================================
+
+voron_status = ttk.LabelFrame(
+    voron_right,
+    text="4. Printer Status",
+    padding=15
+)
+
+voron_status.pack(fill="x", pady=(0, 10))
+
+status_grid = ttk.Frame(voron_status)
+status_grid.pack(fill="x")
+
+ttk.Label(
+    status_grid,
+    text="Firmware:"
+).grid(
+    row=0,
+    column=0,
+    sticky="w",
+    pady=3
+)
+
+ttk.Label(
+    status_grid,
+    textvariable=voron_state_var,
+    font=("Segoe UI", 10, "bold")
+).grid(
+    row=0,
+    column=1,
+    sticky="w",
+    padx=10
+)
+
+ttk.Label(
+    status_grid,
+    text="Homed axes:"
+).grid(
+    row=1,
+    column=0,
+    sticky="w",
+    pady=3
+)
+
+ttk.Label(
+    status_grid,
+    textvariable=voron_homed_var
+).grid(
+    row=1,
+    column=1,
+    sticky="w",
+    padx=10
+)
+
+ttk.Label(
+    status_grid,
+    text="Current job:"
+).grid(
+    row=2,
+    column=0,
+    sticky="w",
+    pady=3
+)
+
+ttk.Label(
+    status_grid,
+    textvariable=voron_job_var
+).grid(
+    row=2,
+    column=1,
+    sticky="w",
+    padx=10
+)
+
+ttk.Label(
+    status_grid,
+    text="Vat:"
+).grid(
+    row=3,
+    column=0,
+    sticky="w",
+    pady=3
+)
+
+ttk.Label(
+    status_grid,
+    text="Manual rotation"
+).grid(
+    row=3,
+    column=1,
+    sticky="w",
+    padx=10
+)
+
+ttk.Label(
+    voron_status,
+    text="Print progress:"
+).pack(anchor="w", pady=(12, 3))
+
+voron_progress = ttk.Progressbar(
+    voron_status,
+    variable=voron_progress_var,
+    maximum=100.0
+)
+
+voron_progress.pack(fill="x")
+
+voron_progress_label = ttk.Label(
+    voron_status,
+    text="0.0%",
+    font=("Segoe UI", 9, "bold")
+)
+
+voron_progress_label.pack(anchor="e", pady=(2, 0))
+
+
+# =========================================================
+# RIGHT — PRINT CONTROL
+# =========================================================
+
+voron_print_controls = ttk.LabelFrame(
+    voron_right,
+    text="5. Print Control",
+    padding=15
+)
+
+voron_print_controls.pack(fill="x", pady=(0, 10))
+
+ttk.Button(
+    voron_print_controls,
+    text="▶ START PRINT",
+    style="Accent.TButton",
+    command=voron_start_print
+).pack(
+    fill="x",
+    ipady=8,
+    pady=3
+)
+
+pause_resume = ttk.Frame(voron_print_controls)
+pause_resume.pack(fill="x", pady=3)
+
+ttk.Button(
+    pause_resume,
+    text="⏸ PAUSE",
+    command=voron_pause_print
+).pack(
+    side=tk.LEFT,
+    fill="x",
+    expand=True,
+    padx=(0, 3)
+)
+
+ttk.Button(
+    pause_resume,
+    text="▶ RESUME",
+    command=voron_resume_print
+).pack(
+    side=tk.LEFT,
+    fill="x",
+    expand=True,
+    padx=(3, 0)
+)
+
+ttk.Button(
+    voron_print_controls,
+    text="CANCEL PRINT",
+    command=voron_cancel_print
+).pack(
+    fill="x",
+    ipady=5,
+    pady=3
+)
+
+ttk.Button(
+    voron_print_controls,
+    text="⏹ EMERGENCY STOP",
+    style="Estop.TButton",
+    command=voron_emergency_stop
+).pack(
+    fill="x",
+    ipady=8,
+    pady=(14, 3)
+)
+
+
+# =========================================================
+# RIGHT — CONSOLE
+# =========================================================
+
+voron_console = ttk.LabelFrame(
+    voron_right,
+    text="6. Voron / Moonraker Messages",
+    padding=10
+)
+
+voron_console.pack(
+    fill="both",
+    expand=True
+)
+
+voron_log = tk.Text(
+    voron_console,
+    height=12,
+    wrap="word",
+    font=("Consolas", 9),
+    bg="#12161c",
+    fg="#A8E6CF",
+    insertbackground="#A8E6CF",
+    state="disabled"
+)
+
+voron_log_scroll = ttk.Scrollbar(
+    voron_console,
+    command=voron_log.yview
+)
+
+voron_log.configure(
+    yscrollcommand=voron_log_scroll.set
+)
+
+voron_log.pack(
+    side=tk.LEFT,
+    fill="both",
+    expand=True
+)
+
+voron_log_scroll.pack(
+    side=tk.RIGHT,
+    fill="y"
+)
+
+_voron_log(
+    "Voron SLA control ready. Enter printer host/IP and connect."
+)
