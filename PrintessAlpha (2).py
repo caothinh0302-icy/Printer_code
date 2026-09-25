@@ -1724,6 +1724,12 @@ import os
 import re
 from PIL import Image, ImageTk
 import sys, faulthandler, datetime
+# voron imports
+import urllib.request
+import urllib.error
+import urllib.parse
+import mimetypes
+import uuid
 
 # --- crash capture -------------------------------------------------------------
 # Writes a full traceback to bioprinter_crash.log on ANY failure, including hard
@@ -2853,6 +2859,685 @@ def stop_scaffold_print():
 def open_lab_website(event): webbrowser.open_new("https://labs.utdallas.edu/hbl/")
 def jump_to_settings(): notebook.select(tab_control)
 
+# Voron UI layout (added by ricky, check here for inaccuracies)
+# ============================================================
+# VORON / SLA PRINTER — MOONRAKER CONTROL
+# Active printer.cfg target:
+#   - Z motion only
+#   - build plate lift
+#   - manual vat rotation
+#   - projector/SLA integration handled by printer-side config
+# ============================================================
+
+_voron_connected = False
+_voron_polling = False
+_voron_busy = False
+
+# These Tk variables are created later when the Voron tab is built.
+voron_host_var = None
+voron_state_var = None
+voron_connection_var = None
+voron_z_var = None
+voron_homed_var = None
+voron_job_var = None
+voron_progress_var = None
+voron_step_var = None
+voron_file_var = None
+
+
+def _voron_base_url():
+    """Return normalized Moonraker base URL from the UI field."""
+    if voron_host_var is None:
+        return ""
+
+    host = voron_host_var.get().strip()
+
+    if not host:
+        return ""
+
+    if not host.startswith(("http://", "https://")):
+        host = "http://" + host
+
+    # printer's uploaded moonraker.conf uses the standard 7125 port
+    parsed = urllib.parse.urlsplit(host)
+
+    if parsed.port is None:
+        host = host.rstrip("/") + ":7125"
+
+    return host.rstrip("/")
+
+
+def _voron_log(msg):
+    """Append one message to the Voron console safely."""
+    try:
+        stamp = time.strftime("%H:%M:%S")
+        voron_log.configure(state="normal")
+        voron_log.insert(tk.END, f"{stamp}  {msg}\n")
+        voron_log.see(tk.END)
+        voron_log.configure(state="disabled")
+    except Exception:
+        print("VORON:", msg)
+
+
+def _voron_request(path, method="GET", data=None,
+                   content_type="application/json", timeout=5.0):
+    """
+    Basic Moonraker HTTP request.
+
+    Returns decoded JSON dictionary.
+    Raises on connection / HTTP errors.
+    """
+
+    base = _voron_base_url()
+    if not base:
+        raise RuntimeError("No Voron host configured")
+
+    url = base + path
+
+    body = data
+    if isinstance(data, str):
+        body = data.encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method=method
+    )
+
+    if body is not None and content_type:
+        req.add_header("Content-Type", content_type)
+
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+
+    if not raw:
+        return {}
+
+    return json.loads(raw.decode("utf-8", "ignore"))
+
+
+def _voron_post_json(path, payload=None, timeout=5.0):
+    return _voron_request(
+        path,
+        method="POST",
+        data=json.dumps(payload or {}),
+        content_type="application/json",
+        timeout=timeout
+    )
+
+
+def _voron_send_gcode(script):
+    """
+    Send ordinary G-code through Moonraker.
+    Used only for controls supported by the active printer.cfg.
+    """
+    payload = {"script": script}
+    return _voron_post_json(
+        "/printer/gcode/script",
+        payload,
+        timeout=10.0
+    )
+
+
+def voron_connect():
+    """
+    Test Moonraker and Klipper state without freezing Tkinter.
+    """
+    global _voron_connected
+
+    if _voron_busy:
+        return
+
+    host = _voron_base_url()
+
+    if not host:
+        messagebox.showwarning(
+            "Voron Connection",
+            "Enter the Voron hostname or IP address first."
+        )
+        return
+
+    voron_connection_var.set("Connecting…")
+    voron_connect_btn.config(state="disabled")
+
+    def worker():
+        global _voron_connected
+
+        try:
+            server = _voron_request("/server/info", timeout=4.0)
+            printer = _voron_request("/printer/info", timeout=4.0)
+
+            p_result = printer.get("result", {})
+            state = p_result.get("state", "unknown")
+            state_message = p_result.get("state_message", "")
+
+            _voron_connected = True
+
+            def done():
+                voron_connection_var.set("Moonraker: Connected")
+                voron_state_var.set(f"State: {state.upper()}")
+                voron_connect_btn.config(
+                    state="normal",
+                    text="RECONNECT"
+                )
+
+                _voron_log("Connected to Moonraker")
+                _voron_log(f"Printer state: {state}")
+
+                if state_message:
+                    _voron_log(state_message.replace("\n", " "))
+
+                _start_voron_polling()
+
+            root.after(0, done)
+
+        except Exception as ex:
+            _voron_connected = False
+
+            def failed():
+                voron_connection_var.set("Moonraker: OFFLINE")
+                voron_state_var.set("State: unavailable")
+                voron_connect_btn.config(
+                    state="normal",
+                    text="CONNECT"
+                )
+                _voron_log(f"Connection failed: {ex}")
+
+            root.after(0, failed)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _query_voron_status():
+    """
+    Read only objects relevant to the active Z-only SLA configuration.
+
+    toolhead.position  -> live XYZ array (we display Z only)
+    toolhead.homed_axes
+    print_stats
+    virtual_sdcard.progress
+    """
+
+    global _voron_busy
+
+    if not _voron_connected or _voron_busy:
+        return
+
+    _voron_busy = True
+
+    try:
+        path = (
+            "/printer/objects/query"
+            "?toolhead=position,homed_axes"
+            "&print_stats=state,filename,message"
+            "&virtual_sdcard=progress"
+        )
+
+        result = _voron_request(path, timeout=3.0)
+        status = result.get("result", {}).get("status", {})
+
+        toolhead = status.get("toolhead", {})
+        print_stats = status.get("print_stats", {})
+        virtual_sd = status.get("virtual_sdcard", {})
+
+        position = toolhead.get("position", [])
+        if isinstance(position, list) and len(position) >= 3:
+            try:
+                z = float(position[2])
+                voron_z_var.set(f"{z:.3f} mm")
+            except Exception:
+                pass
+
+        homed = str(toolhead.get("homed_axes", ""))
+        voron_homed_var.set(
+            "Z" if "z" in homed.lower() else "Not homed"
+        )
+
+        job_state = print_stats.get("state", "standby")
+        filename = print_stats.get("filename", "")
+
+        if filename:
+            voron_job_var.set(f"{filename}  ({job_state})")
+        else:
+            voron_job_var.set(job_state)
+
+        try:
+            progress = float(virtual_sd.get("progress", 0.0))
+            pct = max(0.0, min(100.0, progress * 100.0))
+            voron_progress_var.set(pct)
+            voron_progress_label.config(text=f"{pct:.1f}%")
+        except Exception:
+            pass
+
+        voron_state_var.set(f"State: {job_state.upper()}")
+
+    except Exception as ex:
+        _voron_log(f"Status update failed: {ex}")
+
+    finally:
+        _voron_busy = False
+
+
+def _voron_poll_tick():
+    if _voron_connected:
+        threading.Thread(
+            target=_query_voron_status,
+            daemon=True
+        ).start()
+
+    root.after(1500, _voron_poll_tick)
+
+
+def _start_voron_polling():
+    global _voron_polling
+
+    if _voron_polling:
+        return
+
+    _voron_polling = True
+    root.after(100, _voron_poll_tick)
+
+
+def voron_jog_z(direction):
+    """
+    Jog the actual configured build-plate Z axis.
+
+    Uses relative positioning only for the requested jog, then restores
+    absolute positioning.
+    """
+
+    if not _voron_connected:
+        messagebox.showwarning(
+            "Voron",
+            "Connect to the Voron first."
+        )
+        return
+
+    try:
+        step = float(voron_step_var.get())
+    except Exception:
+        step = 1.0
+
+    dz = step * direction
+
+    script = (
+        "G91\n"
+        f"G1 Z{dz:.3f} F300\n"
+        "G90"
+    )
+
+    def worker():
+        try:
+            _voron_send_gcode(script)
+            root.after(
+                0,
+                lambda: _voron_log(
+                    f"Jog Z {dz:+.3f} mm"
+                )
+            )
+        except Exception as ex:
+            root.after(
+                0,
+                lambda: _voron_log(
+                    f"Z jog failed: {ex}"
+                )
+            )
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def voron_home_z():
+    if not _voron_connected:
+        messagebox.showwarning(
+            "Voron",
+            "Connect to the Voron first."
+        )
+        return
+
+    if not messagebox.askokcancel(
+        "Home Z",
+        "Home the Voron build-plate Z axis?"
+    ):
+        return
+
+    def worker():
+        try:
+            _voron_send_gcode("G28 Z")
+            root.after(
+                0,
+                lambda: _voron_log("Z homing command sent")
+            )
+        except Exception as ex:
+            root.after(
+                0,
+                lambda: _voron_log(
+                    f"Z homing failed: {ex}"
+                )
+            )
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def voron_choose_gcode():
+    path = filedialog.askopenfilename(
+        title="Choose Voron G-code",
+        filetypes=[
+            ("G-code Files", "*.gcode"),
+            ("All Files", "*.*")
+        ]
+    )
+
+    if not path:
+        return
+
+    voron_file_var.set(path)
+
+
+def _multipart_file_body(field_name, filepath):
+    """
+    Build a multipart/form-data upload body using only stdlib.
+    Moonraker's /server/files/upload endpoint accepts multipart uploads.
+    """
+
+    boundary = "----PrintessVoron" + uuid.uuid4().hex
+
+    filename = os.path.basename(filepath)
+
+    mime = (
+        mimetypes.guess_type(filename)[0]
+        or "application/octet-stream"
+    )
+
+    with open(filepath, "rb") as f:
+        payload = f.read()
+
+    chunks = []
+
+    chunks.append(
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="{field_name}"; '
+        f'filename="{filename}"\r\n'
+        f"Content-Type: {mime}\r\n\r\n"
+    .encode("utf-8"))
+
+    chunks.append(payload)
+    chunks.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+
+    return (
+        b"".join(chunks),
+        f"multipart/form-data; boundary={boundary}"
+    )
+
+
+def voron_upload_gcode():
+    """
+    Upload selected G-code to Moonraker without automatically starting it.
+    """
+
+    if not _voron_connected:
+        messagebox.showwarning(
+            "Voron",
+            "Connect to the Voron first."
+        )
+        return
+
+    filepath = voron_file_var.get().strip()
+
+    if not filepath:
+        messagebox.showwarning(
+            "Voron",
+            "Choose a G-code file first."
+        )
+        return
+
+    if not os.path.isfile(filepath):
+        messagebox.showwarning(
+            "Voron",
+            "The selected G-code file no longer exists."
+        )
+        return
+
+    voron_upload_btn.config(
+        state="disabled",
+        text="UPLOADING…"
+    )
+
+    def worker():
+        try:
+            body, ctype = _multipart_file_body(
+                "file",
+                filepath
+            )
+
+            result = _voron_request(
+                "/server/files/upload",
+                method="POST",
+                data=body,
+                content_type=ctype,
+                timeout=30.0
+            )
+
+            item = result.get("result", {}).get("item", {})
+            uploaded = (
+                item.get("path")
+                or os.path.basename(filepath)
+            )
+
+            def done():
+                # Store printer-side filename after upload.
+                voron_file_var.set(uploaded)
+
+                voron_upload_btn.config(
+                    state="normal",
+                    text="UPLOAD"
+                )
+
+                _voron_log(
+                    f"Uploaded G-code: {uploaded}"
+                )
+
+            root.after(0, done)
+
+        except Exception as ex:
+
+            def failed():
+                voron_upload_btn.config(
+                    state="normal",
+                    text="UPLOAD"
+                )
+
+                _voron_log(
+                    f"Upload failed: {ex}"
+                )
+
+            root.after(0, failed)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def voron_start_print():
+    if not _voron_connected:
+        messagebox.showwarning(
+            "Voron",
+            "Connect to the Voron first."
+        )
+        return
+
+    filename = voron_file_var.get().strip()
+
+    # If the field still contains a local absolute path, upload it first.
+    if os.path.isfile(filename):
+        messagebox.showinfo(
+            "Voron",
+            "Upload the selected file first, then press START PRINT."
+        )
+        return
+
+    if not filename:
+        messagebox.showwarning(
+            "Voron",
+            "Choose and upload a G-code file first."
+        )
+        return
+
+    if not messagebox.askokcancel(
+        "Start Voron Print",
+        f"Start this job?\n\n{filename}"
+    ):
+        return
+
+    quoted = urllib.parse.quote(filename, safe="/")
+
+    def worker():
+        try:
+            _voron_post_json(
+                "/printer/print/start"
+                f"?filename={quoted}"
+            )
+
+            root.after(
+                0,
+                lambda: _voron_log(
+                    f"Started print: {filename}"
+                )
+            )
+
+        except Exception as ex:
+            root.after(
+                0,
+                lambda: _voron_log(
+                    f"Start failed: {ex}"
+                )
+            )
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def voron_pause_print():
+    if not _voron_connected:
+        return
+
+    def worker():
+        try:
+            _voron_post_json("/printer/print/pause")
+            root.after(
+                0,
+                lambda: _voron_log("Pause requested")
+            )
+        except Exception as ex:
+            root.after(
+                0,
+                lambda: _voron_log(
+                    f"Pause failed: {ex}"
+                )
+            )
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def voron_resume_print():
+    if not _voron_connected:
+        return
+
+    def worker():
+        try:
+            _voron_post_json("/printer/print/resume")
+            root.after(
+                0,
+                lambda: _voron_log("Resume requested")
+            )
+        except Exception as ex:
+            root.after(
+                0,
+                lambda: _voron_log(
+                    f"Resume failed: {ex}"
+                )
+            )
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def voron_cancel_print():
+    if not _voron_connected:
+        return
+
+    if not messagebox.askokcancel(
+        "Cancel Voron Print",
+        "Cancel the current Voron print?"
+    ):
+        return
+
+    def worker():
+        try:
+            _voron_post_json("/printer/print/cancel")
+            root.after(
+                0,
+                lambda: _voron_log(
+                    "Print cancel requested"
+                )
+            )
+        except Exception as ex:
+            root.after(
+                0,
+                lambda: _voron_log(
+                    f"Cancel failed: {ex}"
+                )
+            )
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def voron_emergency_stop():
+    """
+    Moonraker emergency stop / Klipper shutdown.
+
+    This intentionally requires confirmation because recovery generally
+    requires firmware restart/reconnection.
+    """
+
+    if not _voron_connected:
+        return
+
+    if not messagebox.askyesno(
+        "VORON EMERGENCY STOP",
+        "Emergency-stop the Voron?\n\n"
+        "This will shut down the Klipper printer controller and "
+        "will require recovery/restart before printing again."
+    ):
+        return
+
+    def worker():
+        global _voron_connected
+
+        try:
+            _voron_post_json(
+                "/printer/emergency_stop",
+                timeout=4.0
+            )
+
+        except Exception:
+            # Connection may disappear immediately after an E-stop.
+            pass
+
+        _voron_connected = False
+
+        def done():
+            voron_connection_var.set(
+                "Moonraker: controller stopped"
+            )
+            voron_state_var.set(
+                "State: EMERGENCY STOP"
+            )
+            _voron_log(
+                "EMERGENCY STOP sent"
+            )
+
+        root.after(0, done)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+#end of ricky voron commit
+
 # --- THE VISUALS (Layout) ---
 root = tk.Tk()
 root.title(f"Bioprinting Technologies Demo  —  {BUILD_VERSION}")
@@ -2866,6 +3551,7 @@ tab_home = ttk.Frame(notebook)
 tab_matrix = ttk.Frame(notebook)
 tab_control = ttk.Frame(notebook)
 tab_scaffold = ttk.Frame(notebook)
+tab_voron = ttk.Frame(notebook)
 
 notebook.add(tab_home, text=" Home ")
 # Studio replaces the old Matrix Generate tab
@@ -2881,6 +3567,7 @@ else:
 notebook.add(tab_studio, text=" Studio ")
 notebook.add(tab_scaffold, text=" Print Control ")
 notebook.add(tab_control, text=" Printess Control and Set Up ")
+notebook.add(tab_voron, text=" Voron Control ")
 # tab_matrix is intentionally NOT added to the notebook; Studio supersedes it.
 
 # ==========================================
