@@ -4078,14 +4078,6 @@ gcode_listbox = tk.Listbox(scaf_right, yscrollcommand=gcode_scroll.set, bg="#2E2
 gcode_listbox.pack(side=tk.LEFT, fill="both", expand=True)
 gcode_scroll.config(command=gcode_listbox.yview)
 
-sv_ttk.set_theme("dark") 
-try: scaffold_status_var.set(f"Status: ready — {BUILD_VERSION}")
-except Exception: pass
-try: _apply_pneumatic()            # pneumatic on by default -> grey out stepper-droplet controls now
-except Exception: pass
-root.after(1500, query_position)   # begin live position polling
-root.mainloop()
-
 # voron control tab (start of ricky voron commit)
 
 # ==========================================
@@ -4665,3 +4657,13 @@ voron_log_scroll.pack(
 _voron_log(
     "Voron SLA control ready. Enter printer host/IP and connect."
 )
+
+#end of ricky voron ui commit ^
+
+sv_ttk.set_theme("dark") 
+try: scaffold_status_var.set(f"Status: ready — {BUILD_VERSION}")
+except Exception: pass
+try: _apply_pneumatic()            # pneumatic on by default -> grey out stepper-droplet controls now
+except Exception: pass
+root.after(1500, query_position)   # begin live position polling
+root.mainloop()
